@@ -1,10 +1,13 @@
+#include <iostream>
 #include <signal.h>
-#include <string.h>
+#include <sstream>
+#include <string>
 #include <sys/stat.h>
 
 #include <boost/date_time/local_time/local_time.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
+#include <boost/thread.hpp>
 
 #include <pcl/point_cloud.h>
 #include <pcl_ros/point_cloud.h>
@@ -13,6 +16,8 @@
 #include <ros/ros.h>
 #include <ros/subscriber.h>
 #include <sensor_msgs/PointCloud2.h>
+
+boost::thread_group grp;
 
 namespace po = boost::program_options;
 
@@ -23,39 +28,99 @@ std::string pcdprefix;
 std::string pcdpath;
 std::string topic;
 bool pcdbinary;
-int recvNum=0;
-void registedLaserCloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
+
+int recvNum = 0; // recv frame num
+int saveStartPoint = 0; // start pointer to be saving
+int partitionSize = 0; // control the frame number of partition
+
+int partNum = 0;
+
+void mergeAndExport(std::string path, bool toEnd);
+
+//! Work thread
+struct OutputOp {
+    OutputOp(std::string path)
+    {
+        this->path = path;
+    }
+    void operator()()
+    {
+        mergeAndExport(path, false);
+    }
+
+    std::string path;
+};
+
+//! pcl topic callback
+void pclMsgCallback(const sensor_msgs::PointCloud2ConstPtr& pclMsg)
 {
     if (storageLock)
         return;
-    pcl::PointCloud<pcl::PointXYZ> laserCloudIn;
-    pcl::fromROSMsg(*laserCloudMsg, laserCloudIn);
-    storage.push_back(laserCloudIn);
-    ROS_INFO_STREAM("Recv "<<recvNum++);
+    pcl::PointCloud<pcl::PointXYZ> pclCloud;
+    pcl::fromROSMsg(*pclMsg, pclCloud);
+    storage.push_back(pclCloud);
+    ROS_INFO_STREAM("Recv " << recvNum++);
+    if (partitionSize != 0) {
+        if (recvNum % partitionSize == 0) {
+            partNum++;
+            ROS_INFO_STREAM("PARTNUM " << partNum);
+            std::string path = pcdpath;
+            std::ostringstream oss;
+            oss << "p" << partNum;
+            path.insert(path.size() - 4, oss.str());
+            boost::thread* t = grp.create_thread(OutputOp(path));
+        }
+    }
 }
 
-void exportMergedMap()
+//! merge and export frames to pcd file
+void mergeAndExport(std::string path, bool toEnd)
 {
     ROS_INFO("Start merging...");
     pcl::PointCloud<pcl::PointXYZ> cloudOut;
-    std::list<pcl::PointCloud<pcl::PointXYZ> >::iterator it = storage.begin(), end = storage.end();
+
+    std::list<pcl::PointCloud<pcl::PointXYZ> >::iterator it = storage.begin();
+    std::advance(it, saveStartPoint);
+    std::list<pcl::PointCloud<pcl::PointXYZ> >::iterator end = it;
+    if (toEnd) {
+        end = storage.end();
+    } else {
+        std::advance(end, partitionSize);
+        saveStartPoint += partitionSize;
+    }
+
     for (; it != end; ++it) {
         cloudOut += *it;
         it->clear();
     }
-    ROS_INFO_STREAM("Merged: " << cloudOut.size());
-    ROS_INFO("Start saving, please wait...");
-    pcl::io::savePCDFile(pcdpath, cloudOut, pcdbinary);
+    ROS_INFO_STREAM("Merged " << cloudOut.size());
+    if (cloudOut.empty()) {
+        ROS_INFO("Empty, exit.");
+        return;
+    }
+    ROS_INFO_STREAM("Start saving, please wait...\n"
+        << path);
+    pcl::io::savePCDFile(path, cloudOut, pcdbinary);
     ROS_INFO("File save success, Good bye.");
 }
 
+//! capturing terminal sig
 void exitNode(int sig)
 {
     storageLock = true;
-    ROS_INFO_STREAM("SIG " << sig << " RECEIVED.");
-    exportMergedMap();
+    grp.join_all();
+    std::string path = pcdpath;
+    if (partNum != 0) {
+        partNum++;
+        std::ostringstream oss;
+        oss << "p" << partNum;
+        path.insert(path.size() - 4, oss.str());
+    }
+    mergeAndExport(path, true);
     ros::shutdown();
 }
+
+//! convert current time to string
 template <class T>
 std::string timeToStr(T ros_t)
 {
@@ -67,6 +132,7 @@ std::string timeToStr(T ros_t)
     return msg.str();
 }
 
+//! generate file name
 void updateFilenames()
 {
     std::vector<std::string> parts;
@@ -91,10 +157,10 @@ void updateFilenames()
 
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "loam_gatherMap");
+    ros::init(argc, argv, "gatherpclmsg");
     ros::NodeHandle nh;
     po::options_description desc("Allowed options");
-    desc.add_options()("help,h", "print help message")("output,o", po::value<std::string>(), "explictly output file name")("binary,b", po::value<bool>()->default_value(true), "write binary PCD")("prefix,p", po::value<std::string>(), "output prefix")("topic", "topic which would be subscribed");
+    desc.add_options()("help,h", "print help message")("output,o", po::value<std::string>(), "explictly output file name")("binary,b", po::value<bool>()->default_value(true), "write binary PCD")("prefix,p", po::value<std::string>(), "output prefix")("partition,t", po::value<int>()->default_value(0), "frame num of a partition ( 0 for no parititon)")("topic", "topic which would be subscribed");
     po::positional_options_description p;
     p.add("topic", -1);
     po::variables_map vm;
@@ -115,6 +181,9 @@ int main(int argc, char** argv)
     if (vm.count("prefix")) {
         pcdprefix = vm["prefix"].as<std::string>();
     }
+    if (vm.count("partition")) {
+        partitionSize = vm["partition"].as<int>();
+    }
     if (vm.count("output")) {
         pcdpath = vm["output"].as<std::string>();
     } else {
@@ -130,12 +199,13 @@ int main(int argc, char** argv)
     signal(SIGTERM, &exitNode);
     signal(SIGINT, &exitNode);
     storageLock = false;
-    ros::Subscriber subPointCloudMsg = nh.subscribe<sensor_msgs::PointCloud2>(topic, 2, registedLaserCloudHandler);
+    ros::Subscriber subPointCloudMsg = nh.subscribe<sensor_msgs::PointCloud2>(topic, 2, pclMsgCallback);
 
-    ROS_INFO_STREAM("=Prefix: " << pcdprefix);
-    ROS_INFO_STREAM("=Output: " << pcdpath);
-    ROS_INFO_STREAM("=Use Binary: " << pcdbinary);
-    ROS_INFO_STREAM("=Topic: " << topic);
+    ROS_INFO_STREAM("|Prefix:\t| " << pcdprefix);
+    ROS_INFO_STREAM("|Output:\t| " << pcdpath);
+    ROS_INFO_STREAM("|BinaryPCD:\t| " << pcdbinary);
+    ROS_INFO_STREAM("|Paritition:\t| " << partitionSize);
+    ROS_INFO_STREAM("|Topic:\t\t| " << topic);
     ros::spin();
 
     return 0;

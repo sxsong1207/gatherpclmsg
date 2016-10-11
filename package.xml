@@ -1,8 +1,9 @@
 <?xml version="1.0"?>
 <package>
   <name>gatherpclmsg</name>
-  <version>0.1.0</version>
-  <description>The gatherpclmsg package subscribes the PCL msgs from designated topic, collect it and save to PCD file. Use Ctrl-C to stop collecting.</description>
+  <version>1.0.0</version>
+  <description>The ROS package, used to gather PCL point cloud topic and save to designated path. This package listen to topic when it started and terminates when user input CTRL-C.
+  If the cloud data would surpass your memory capacity. Partition feature is ready for this. For more detail, please read in Usage section.</description>
 
   <!-- One maintainer tag required, multiple allowed, one person per tag --> 
   <!-- Example:  -->
